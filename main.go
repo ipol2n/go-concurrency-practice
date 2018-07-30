@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/streadway/amqp"
 )
@@ -19,6 +20,7 @@ func failOnError(err error, msg string) {
 	}
 }
 
+// Result ...
 type Result struct {
 	ID       string
 	Name     string
@@ -43,11 +45,12 @@ func fetchAPI(url string, c chan Result) {
 
 func fetch(postID string, c chan Result, sem chan bool) {
 	fetchC := make(chan Result)
+	time.Sleep(100 * time.Millisecond)
 	go fetchAPI("http://127.0.0.1:3000/posts/"+postID, fetchC)
 	go fetchAPI("http://127.0.0.1:3001/posts/"+postID, fetchC)
 	result := <-fetchC
 	<-sem
-	fmt.Printf("Unlock: current buffer size is %d\n", len(sem))
+	// fmt.Printf("Unlock: current buffer size is %d\n", len(sem))
 	c <- result
 }
 
@@ -62,7 +65,7 @@ func createQueue(ch *amqp.Channel, queueName string) amqp.Queue {
 	)
 	failOnError(err, "Failed to declare a queue")
 	err = ch.Qos(
-		1,     // prefetch count
+		10000, // prefetch count
 		0,     // prefetch size
 		false, // global
 	)
@@ -102,37 +105,65 @@ func main() {
 
 	forever := make(chan bool)
 	base := 0
-	c := make(chan Result)
-	concurrency := 5
+	concurrency := 1
 	sem := make(chan bool, concurrency)
+	runningRoutines := make(map[string]chan bool)
 	go func() {
 		for {
 			select {
 			case d := <-inputConsumer:
 				body := string(d.Body)
 				fmt.Printf("Get input: %s\n", body)
+				fmt.Println("Current routines: ", runningRoutines)
+				if stopChan, exist := runningRoutines[body]; exist {
+					fmt.Printf("Stop old routine %s\n", body)
+					close(stopChan)
+					delete(runningRoutines, body)
+					time.Sleep(3 * time.Second)
+				}
+				runningRoutines[body] = make(chan bool)
 				numbers := strings.Split(body, ",")
-				for _, v := range numbers {
-					n, _ := strconv.Atoi(v)
-					sem <- true
-					fmt.Printf("lock: current buffer size is %d\n", len(sem))
-					go fetch(fmt.Sprintf("%d", n+base), c, sem)
-				}
-				for i := 0; i < len(numbers); i++ {
-					s, _ := json.Marshal(<-c)
-					fmt.Println(string(s))
-					err = ch.Publish(
-						"",      // exchange
-						q3.Name, // routing key
-						false,   // mandatory
-						false,
-						amqp.Publishing{
-							DeliveryMode: amqp.Persistent,
-							ContentType:  "application/json",
-							Body:         s,
-						})
-				}
-				d.Ack(false)
+				go func() {
+				loop:
+					for {
+						select {
+						case _, more := <-runningRoutines[body]:
+							if !more {
+								fmt.Println("Stopped !!")
+								break loop
+							}
+						default:
+							c := make(chan Result)
+							for _, v := range numbers {
+								n, _ := strconv.Atoi(v)
+								sem <- true
+								// fmt.Printf("Lock: current buffer size is %d\n", len(sem))
+								go fetch(fmt.Sprintf("%d", n+base), c, sem)
+							}
+							for i := 0; i < len(numbers); i++ {
+								s, _ := json.Marshal(<-c)
+								// fmt.Println(string(s))
+								err = ch.Publish(
+									"",      // exchange
+									q3.Name, // routing key
+									false,   // mandatory
+									false,
+									amqp.Publishing{
+										DeliveryMode: amqp.Persistent,
+										ContentType:  "application/json",
+										Body:         s,
+									})
+							}
+							if stopChan, exist := runningRoutines[body]; exist {
+								close(stopChan)
+								delete(runningRoutines, body)
+							}
+							fmt.Println("FINISH !!!!")
+							break loop
+						}
+					}
+					d.Ack(false)
+				}()
 			case d := <-baseConsumer:
 				base, _ = strconv.Atoi(string(d.Body))
 				fmt.Printf("Got new base: %d\n", base)
