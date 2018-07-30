@@ -41,11 +41,13 @@ func fetchAPI(url string, c chan Result) {
 	c <- result
 }
 
-func fetch(postID string, c chan Result) {
+func fetch(postID string, c chan Result, sem chan bool) {
 	fetchC := make(chan Result)
 	go fetchAPI("http://127.0.0.1:3000/posts/"+postID, fetchC)
 	go fetchAPI("http://127.0.0.1:3001/posts/"+postID, fetchC)
 	result := <-fetchC
+	<-sem
+	fmt.Printf("Unlock: current buffer size is %d\n", len(sem))
 	c <- result
 }
 
@@ -101,15 +103,20 @@ func main() {
 	forever := make(chan bool)
 	base := 0
 	c := make(chan Result)
+	concurrency := 5
+	sem := make(chan bool, concurrency)
 	go func() {
 		for {
 			select {
 			case d := <-inputConsumer:
 				body := string(d.Body)
+				fmt.Printf("Get input: %s\n", body)
 				numbers := strings.Split(body, ",")
 				for _, v := range numbers {
 					n, _ := strconv.Atoi(v)
-					go fetch(fmt.Sprintf("%d", n+base), c)
+					sem <- true
+					fmt.Printf("lock: current buffer size is %d\n", len(sem))
+					go fetch(fmt.Sprintf("%d", n+base), c, sem)
 				}
 				for i := 0; i < len(numbers); i++ {
 					s, _ := json.Marshal(<-c)
